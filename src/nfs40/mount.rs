@@ -476,6 +476,8 @@ impl RecoveryContext {
             }
             open.stateid = reclaimed.stateid;
             open.next_seqid = 1;
+            // 回收拿到了新的 stateid，之前的过期标记随之失效。
+            open.stateid_stale = false;
             Ok(())
         })
         .await?;
@@ -3342,6 +3344,14 @@ mod tests {
             wsize: 1_048_576,
             acl_supported: false,
         });
+        mount
+            .state
+            .by_owner(75)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .stateid_stale = true;
         let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
         let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
@@ -3386,9 +3396,14 @@ mod tests {
         server.await.unwrap().unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if mount.state.by_owner(75).await.unwrap().lock().await.stateid == [0x85; 16] {
+                let lane = mount.state.by_owner(75).await.unwrap();
+                let lane = lane.lock().await;
+                // 回收成功后必须清掉过期标记，否则后续 READ 会一直绕过有效的
+                // OPEN stateid。
+                if lane.stateid == [0x85; 16] && !lane.stateid_stale {
                     break;
                 }
+                drop(lane);
                 tokio::task::yield_now().await;
             }
         })
