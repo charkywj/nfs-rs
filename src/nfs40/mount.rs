@@ -592,10 +592,17 @@ fn is_lost_stateid(error: &NfsError) -> bool {
     matches!(
         error,
         NfsError::Nfs4(
-            crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-                | crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
-                | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
+            crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID | crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
         )
+    )
+}
+
+/// stateid 的 seqid 落后（NFS4ERR_OLD_STATEID）：服务端仍然持有该 open state，
+/// 因此只重放本次 READ，不能销毁本地 lane，否则服务端状态要等租约到期才回收。
+fn is_outdated_stateid(error: &NfsError) -> bool {
+    matches!(
+        error,
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)
     )
 }
 
@@ -1160,11 +1167,14 @@ impl Mount40 {
         ))
     }
 
-    /// 携带 OPEN stateid 的 READ；没有 lane 时直接使用匿名 stateid。
-    async fn read_with_open_state(&self, fh: &Bytes, offset: u64, count: u32) -> Result<Bytes> {
-        let Some(lane) = self.state.for_fh(fh, crate::OPEN_READ).await else {
-            return self.read_anonymous(fh, offset, count).await;
-        };
+    /// 携带 OPEN stateid 的 READ。
+    async fn read_with_lane(
+        &self,
+        fh: &Bytes,
+        offset: u64,
+        count: u32,
+        lane: Arc<tokio::sync::Mutex<OwnerLane>>,
+    ) -> Result<Bytes> {
         let fh = fh.clone();
         let expected_generation = self.lease.begin_stateful("read")?;
         let io_guard = if let Some(callback_state) = &self.callback_state {
@@ -1225,19 +1235,17 @@ impl Mount40 {
         )
     }
 
-    /// 丢弃该句柄上已失效的 OPEN lane。服务端已拒绝该 stateid，本地不再发送 CLOSE，
-    /// 由服务端在租约到期后回收；这里只保证后续读取不再引用失效状态。
-    async fn drop_lost_open_state(&self, fh: &Bytes) {
-        for lane in self.state.snapshot().await {
-            let owner = {
-                let guard = lane.lock().await;
-                if guard.fh != *fh {
-                    continue;
-                }
-                guard.owner
-            };
-            self.state.remove(owner, fh).await;
-        }
+    /// 丢弃已失效的 OPEN lane。服务端已经不认这个 stateid，本地不再引用它，也不再为
+    /// 它发送 CLOSE；只删除本次失败用到的那一条，避免影响同文件上其他有效的 OPEN。
+    async fn drop_lost_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>, fh: &Bytes) {
+        let owner = {
+            let guard = lane.lock().await;
+            if guard.fh != *fh {
+                return;
+            }
+            guard.owner
+        };
+        self.state.remove(owner, fh).await;
     }
 }
 
@@ -1725,11 +1733,11 @@ impl Mount for Mount40 {
                 "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
             ));
         }
-        let lane = self
-            .state
-            .for_fh(&fh, crate::OPEN_BOTH)
-            .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 CLOSE requires an open file".into()))?;
+        let Some(lane) = self.state.for_fh(&fh, crate::OPEN_BOTH).await else {
+            // OPEN state 已在 READ 的 stateid 恢复中被丢弃：服务端本来就不认它，
+            // CLOSE 退化为本地 no-op。
+            return Ok(());
+        };
         self.close_lane(lane).await
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
@@ -1748,9 +1756,10 @@ impl Mount for Mount40 {
                 "open file belongs to another mount generation".into(),
             ));
         }
-        let lane = self.state.by_owner(owner).await.ok_or_else(|| {
-            NfsError::InvalidInput("NFSv4.0 open state is closed or stale".into())
-        })?;
+        let Some(lane) = self.state.by_owner(owner).await else {
+            // 同上：stateid 恢复后本地已移除该状态，CLOSE 视为已完成。
+            return Ok(());
+        };
         if lane.lock().await.fh != object.fh {
             return Err(NfsError::InvalidInput(
                 "NFSv4.0 open state filehandle mismatch".into(),
@@ -2345,12 +2354,22 @@ impl Mount for Mount40 {
         if count == 0 {
             return Ok(Bytes::new());
         }
-        match self.read_with_open_state(&fh, offset, count).await {
+        let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await else {
+            return self.read_anonymous(&fh, offset, count).await;
+        };
+        match self
+            .read_with_lane(&fh, offset, count, Arc::clone(&lane))
+            .await
+        {
             Err(error) if is_lost_stateid(&error) => {
                 // RFC 7530 §9.1.4.3：服务端不再承认该 OPEN stateid 时，READ 可改用
-                // 匿名 stateid 重放；READ 幂等，重放一次是安全的。同时丢弃本地失效
-                // lane，避免后续读取继续复用同一个已失效的 stateid。
-                self.drop_lost_open_state(&fh).await;
+                // 匿名 stateid 重放；READ 幂等，重放一次是安全的。同时丢弃这条失效
+                // lane，避免后续每次读取都复用同一个已失效的 stateid。
+                self.drop_lost_lane(lane, &fh).await;
+                self.read_anonymous(&fh, offset, count).await
+            }
+            Err(error) if is_outdated_stateid(&error) => {
+                // seqid 落后但服务端仍持有该 open state：保留 lane，只重放本次 READ。
                 self.read_anonymous(&fh, offset, count).await
             }
             result => result,
@@ -5683,8 +5702,157 @@ mod tests {
                 .is_none(),
             "the rejected OPEN state must not stay registered"
         );
+        // 恢复后调用方仍会 CLOSE；失效状态已从本地移除，CLOSE 必须是 no-op 而不是报错。
+        mount
+            .close(Bytes::from_static(b"fh"))
+            .await
+            .expect("CLOSE after a recovered read must be a no-op");
         mount.umount().await.unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_stateid_drops_only_the_rejected_open_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 81, b"fh").await;
+        mount
+            .state
+            .register(OwnerLane {
+                owner: 82,
+                next_seqid: 1,
+                stateid: [0x62; 16],
+                fh: Bytes::from_static(b"fh"),
+                access: crate::OPEN_BOTH,
+                write_verifier: None,
+                io_fence: Arc::new(tokio::sync::RwLock::new(())),
+                closing: false,
+            })
+            .await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let refused = read_record(&mut stream).await?;
+            // for_fh 取同文件上最近注册的 OPEN，也就是 owner 82 的 lane。
+            assert_eq!(read_request_stateid(&refused), [0x62; 16]);
+            reply(
+                &mut stream,
+                &refused,
+                &failed_lock_result("read", 25, 10025),
+            )
+            .await?;
+            let replayed = read_record(&mut stream).await?;
+            assert_eq!(read_request_stateid(&replayed), [0; 16]);
+            let mut read_data = Vec::new();
+            read_data.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut read_data, b"x");
+            reply(
+                &mut stream,
+                &replayed,
+                &compound_result("read", &[(22, &[]), (25, &read_data)]),
+            )
+            .await
+        });
+        assert_eq!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
+            Bytes::from_static(b"x")
+        );
+        assert!(mount.state.by_owner(82).await.is_none());
+        assert!(
+            mount.state.by_owner(81).await.is_some(),
+            "同一文件上的其他有效 OPEN 必须保留"
+        );
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outdated_stateid_replays_read_without_discarding_open_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 81, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let refused = read_record(&mut stream).await?;
+            assert_eq!(read_request_stateid(&refused), [0x61; 16]);
+            reply(
+                &mut stream,
+                &refused,
+                &failed_lock_result("read", 25, 10024),
+            )
+            .await?;
+            let replayed = read_record(&mut stream).await?;
+            assert_eq!(read_request_stateid(&replayed), [0; 16]);
+            let mut read_data = Vec::new();
+            read_data.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut read_data, b"x");
+            reply(
+                &mut stream,
+                &replayed,
+                &compound_result("read", &[(22, &[]), (25, &read_data)]),
+            )
+            .await
+        });
+        assert_eq!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
+            Bytes::from_static(b"x")
+        );
+        assert!(
+            mount
+                .state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_BOTH)
+                .await
+                .is_some(),
+            "OLD_STATEID keeps the server-side open state, so the lane must stay"
+        );
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_anonymous_replay_is_not_retried_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 81, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let refused = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &refused,
+                &failed_lock_result("read", 25, 10025),
+            )
+            .await?;
+            let replayed = read_record(&mut stream).await?;
+            assert_eq!(read_request_stateid(&replayed), [0; 16]);
+            reply(
+                &mut stream,
+                &replayed,
+                &failed_lock_result("read", 25, 10025),
+            )
+            .await
+        });
+        assert!(matches!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await,
+            Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID))
+        ));
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn stateid_recovery_classification() {
+        let cases = [
+            (crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID, true, false),
+            (crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID, true, false),
+            (crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID, false, true),
+            (crate::Nfs4ErrorCode::NFS4ERR_EXPIRED, false, false),
+            (crate::Nfs4ErrorCode::NFS4ERR_ACCESS, false, false),
+        ];
+        for (code, lost, outdated) in cases {
+            let error = NfsError::Nfs4(code);
+            assert_eq!(is_lost_stateid(&error), lost, "{code:?}");
+            assert_eq!(is_outdated_stateid(&error), outdated, "{code:?}");
+        }
     }
 
     fn read_request_stateid(request: &[u8]) -> [u8; 16] {
