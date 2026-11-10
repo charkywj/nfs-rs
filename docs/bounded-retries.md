@@ -41,8 +41,10 @@ responsibility after their caller stops waiting.
   with the anonymous stateid, and only after the rejected OPEN lane is dropped
   locally: the old state is left for lease expiry and is never reused. A READ
   rejected with OLD_STATEID is replayed the same way but keeps the lane, because
-  the server still owns that open state. Both recoveries are separate from the
-  busy budget and are not repeated.
+  the server still owns that open state; the lane is then marked stale so later
+  READs go straight to the anonymous stateid instead of repeating a request that
+  is known to be rejected. Both recoveries are separate from the busy budget and
+  are not repeated.
 - NFSv4.1 and v4.2 MDS and independent pNFS DS calls use the same shared policy.
   DELAY on SEQUENCE retains that slot/sequence identity; DELAY on a subsequent
   operation uses a new sequence after the successful SEQUENCE is acknowledged.

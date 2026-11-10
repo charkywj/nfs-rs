@@ -586,8 +586,9 @@ fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
     }
 }
 
-/// 服务端已不再承认的 OPEN stateid（RFC 7530 §9.1.4.3、§16.21.1）。这类错误对
-/// 无状态 READ 可恢复：丢弃本地 lane 后用匿名 stateid 重放即可。
+/// 服务端已不再承认的 OPEN stateid（RFC 7530 §13.1.5.2 BAD_STATEID、§13.1.5.6
+/// STALE_STATEID）。这类错误对无状态 READ（§16.23）可恢复：丢弃本地 lane 后用
+/// 匿名 stateid（§9.1.4.3）重放即可。
 fn is_lost_stateid(error: &NfsError) -> bool {
     matches!(
         error,
@@ -597,8 +598,9 @@ fn is_lost_stateid(error: &NfsError) -> bool {
     )
 }
 
-/// stateid 的 seqid 落后（NFS4ERR_OLD_STATEID）：服务端仍然持有该 open state，
-/// 因此只重放本次 READ，不能销毁本地 lane，否则服务端状态要等租约到期才回收。
+/// stateid 的 seqid 落后（RFC 7530 §13.1.5.5 NFS4ERR_OLD_STATEID）：服务端仍然
+/// 持有该 open state，因此只重放本次 READ，不能销毁本地 lane，否则服务端状态
+/// 要等租约到期才回收。
 fn is_outdated_stateid(error: &NfsError) -> bool {
     matches!(
         error,
@@ -872,6 +874,7 @@ impl Mount40 {
                     fh: fh.clone(),
                     access,
                     write_verifier: None,
+                    stateid_stale: false,
                     io_fence: Arc::new(tokio::sync::RwLock::new(())),
                     closing: false,
                 })
@@ -2357,6 +2360,9 @@ impl Mount for Mount40 {
         let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await else {
             return self.read_anonymous(&fh, offset, count).await;
         };
+        if lane.lock().await.stateid_stale {
+            return self.read_anonymous(&fh, offset, count).await;
+        }
         match self
             .read_with_lane(&fh, offset, count, Arc::clone(&lane))
             .await
@@ -2369,7 +2375,10 @@ impl Mount for Mount40 {
                 self.read_anonymous(&fh, offset, count).await
             }
             Err(error) if is_outdated_stateid(&error) => {
-                // seqid 落后但服务端仍持有该 open state：保留 lane，只重放本次 READ。
+                // seqid 落后但服务端仍持有该 open state：保留 lane（丢弃会让服务端
+                // 状态等租约到期才回收），只重放本次 READ，并标记本地 stateid 过期，
+                // 后续 READ 直接用匿名 stateid，不再空跑一次注定被拒的请求。
+                lane.lock().await.stateid_stale = true;
                 self.read_anonymous(&fh, offset, count).await
             }
             result => result,
@@ -3281,6 +3290,7 @@ mod tests {
                 fh: Bytes::from_static(b"fh"),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                stateid_stale: false,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),
                 closing: false,
             })
@@ -5725,6 +5735,7 @@ mod tests {
                 fh: Bytes::from_static(b"fh"),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                stateid_stale: false,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),
                 closing: false,
             })
@@ -5790,11 +5801,28 @@ mod tests {
                 &replayed,
                 &compound_result("read", &[(22, &[]), (25, &read_data)]),
             )
+            .await?;
+            // lane 已被标记为 stateid 过期：第二次 READ 必须直接用匿名 stateid，
+            // 不再先发一次注定被拒的 stateid 请求。
+            let again = read_record(&mut stream).await?;
+            assert_eq!(read_request_stateid(&again), [0; 16]);
+            let mut read_data = Vec::new();
+            read_data.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut read_data, b"y");
+            reply(
+                &mut stream,
+                &again,
+                &compound_result("read", &[(22, &[]), (25, &read_data)]),
+            )
             .await
         });
         assert_eq!(
             mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
             Bytes::from_static(b"x")
+        );
+        assert_eq!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
+            Bytes::from_static(b"y")
         );
         assert!(
             mount
@@ -5876,6 +5904,7 @@ mod tests {
                 fh: Bytes::from_static(fh),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                stateid_stale: false,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),
                 closing: false,
             })

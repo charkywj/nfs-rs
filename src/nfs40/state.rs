@@ -11,6 +11,10 @@ pub(crate) struct OwnerLane {
     pub fh: Bytes,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
+    /// READ 曾收到 NFS4ERR_OLD_STATEID：服务端的 seqid 已领先，本地 stateid 不再
+    /// 可用。lane 保留（服务端仍持有该 open state），但后续 READ 直接使用匿名
+    /// stateid，避免每次都用同一个过期 stateid 空跑一次 RPC。
+    pub stateid_stale: bool,
     /// Shared permits cover in-flight stateid I/O. CLOSE takes the exclusive
     /// permit after setting `closing`, so it cannot overtake an issued RPC.
     pub io_fence: Arc<RwLock<()>>,
@@ -220,6 +224,7 @@ mod tests {
                         crate::OPEN_WRITE
                     },
                     write_verifier: None,
+                    stateid_stale: false,
                     io_fence: Arc::new(RwLock::new(())),
                     closing: false,
                 })
