@@ -37,6 +37,10 @@ responsibility after their caller stops waiting.
   state machine; replaying an old owner seqid could replay a cached error.
   They are not blindly reissued by the generic busy loop. See
   [RFC 7530 section 13.1.1.3](https://www.rfc-editor.org/rfc/rfc7530.html#section-13.1.1.3).
+  A READ rejected with BAD_STATEID, STALE_STATEID or OLD_STATEID is replayed at
+  most once with the anonymous stateid after the rejected OPEN lane is dropped
+  locally. The old state is left for lease expiry and is never reused; this
+  recovery is separate from the busy budget and is not repeated.
 - NFSv4.1 and v4.2 MDS and independent pNFS DS calls use the same shared policy.
   DELAY on SEQUENCE retains that slot/sequence identity; DELAY on a subsequent
   operation uses a new sequence after the successful SEQUENCE is acknowledged.
