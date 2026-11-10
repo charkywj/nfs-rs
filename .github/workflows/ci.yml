@@ -8,9 +8,15 @@ on:
 permissions:
   contents: read
 
+# PR 上新的推送取消同一分支正在跑的旧流水线，避免重复占用 runner。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -28,19 +34,29 @@ jobs:
       - run: cargo test --doc
 
   python:
+    # abi3-py311 轮子对所有 >=3.11 的解释器通用，因此只测两端：
+    # 3.11 覆盖最低支持版本，3.14 覆盖最新版本的前向兼容。
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.14"]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'Cargo.lock') }}
+          restore-keys: pip-${{ runner.os }}-${{ matrix.python-version }}-
       - uses: Swatinem/rust-cache@v2
-      - run: python -m pip install "maturin>=1,<2" mypy pytest
+      - run: >-
+          python -m pip install --disable-pip-version-check
+          "maturin>=1,<2" "mypy>=1,<2" "pytest>=8,<9"
       - run: cargo test --locked --features python-bindings --lib
       - run: cargo check --locked --features python-extension
       - run: maturin build --locked --features python-test-support --out target/wheels
@@ -61,17 +77,23 @@ jobs:
 
   python-artifacts:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-dist-${{ hashFiles('pyproject.toml', 'Cargo.lock') }}
+          restore-keys: pip-${{ runner.os }}-dist-
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: "0.13.0"
       - uses: Swatinem/rust-cache@v2
-      - run: python -m pip install "maturin>=1,<2"
+      - run: python -m pip install --disable-pip-version-check "maturin>=1,<2"
       - run: >-
           maturin build --release --locked --compatibility manylinux2014 --zig
           --out target/python-artifacts
